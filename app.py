@@ -6,6 +6,7 @@ import base64
 from supabase import create_client, Client
 import time
 from datetime import datetime
+from streamlit_geolocation import streamlit_geolocation
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -38,10 +39,15 @@ supabase = get_supabase()
 BUCKET = "closet"
 
 # ── Weather ───────────────────────────────────────────────────────────────────
-def get_auto_city() -> str:
+def city_from_coords(lat: float, lon: float) -> str:
     try:
-        r = requests.get("https://ipapi.co/json/", timeout=4)
-        return r.json().get("city", "New York")
+        r = requests.get(
+            "https://api.openweathermap.org/geo/1.0/reverse",
+            params={"lat": lat, "lon": lon, "limit": 1, "appid": st.secrets["OPENWEATHER_API_KEY"]},
+            timeout=5,
+        )
+        data = r.json()
+        return data[0]["name"] if data else "New York"
     except Exception:
         return "New York"
 
@@ -145,10 +151,11 @@ with st.sidebar:
     # ── Weather ────────────────────────────────────────────────────────────────
     st.header("🌤️ Today's Weather")
 
-    if "auto_city" not in st.session_state:
-        st.session_state.auto_city = get_auto_city()
+    loc = streamlit_geolocation()
+    if loc and loc.get("latitude") and "auto_city" not in st.session_state:
+        st.session_state.auto_city = city_from_coords(loc["latitude"], loc["longitude"])
 
-    city = st.text_input("City", value=st.session_state.auto_city)
+    city = st.text_input("City", value=st.session_state.get("auto_city", ""))
 
     if city:
         weather = get_weather(city)
