@@ -3,7 +3,9 @@ import requests
 from PIL import Image
 import io
 import base64
+import json
 from supabase import create_client, Client
+import anthropic
 import time
 from datetime import datetime
 from streamlit_geolocation import streamlit_geolocation
@@ -11,7 +13,7 @@ from streamlit_geolocation import streamlit_geolocation
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="My Closet & Weather",
-    page_icon="👗",
+    page_icon="🕴",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -144,6 +146,73 @@ def run_virtual_tryon(human_url: str, garment_url: str, garment_type: str) -> st
 
     raise Exception("Timed out waiting for try-on result.")
 
+# ── Smart Fit ─────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_anthropic_client():
+    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+def _image_b64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode()
+
+def analyze_body_proportions(image_url: str) -> dict:
+    img_bytes = requests.get(image_url, timeout=10).content
+    response = get_anthropic_client().messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _image_b64(img_bytes)}},
+                {"type": "text", "text": (
+                    "Analyze this full-body photo and estimate clothing-relevant body proportions. "
+                    "Return ONLY a JSON object with these keys: "
+                    "body_type (slim/athletic/average/fuller), "
+                    "shoulder_width (narrow/average/broad), "
+                    "torso_length (short/average/long), "
+                    "hip_width (narrow/average/wide), "
+                    "height_estimate (petite/average/tall), "
+                    "build_notes (1–2 sentences on proportions relevant to fit)."
+                )}
+            ]
+        }]
+    )
+    return json.loads(response.content[0].text)
+
+def read_garment_tag(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    response = get_anthropic_client().messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": _image_b64(image_bytes)}},
+                {"type": "text", "text": (
+                    "Read this clothing tag and extract all sizing information. "
+                    "Return ONLY a JSON object with these keys (null if not found): "
+                    "size_label, chest_cm, waist_cm, hip_cm, length_cm, inseam_cm, "
+                    "brand, garment_type, fabric, raw_text."
+                )}
+            ]
+        }]
+    )
+    return json.loads(response.content[0].text)
+
+def get_fit_report(body: dict, tag: dict) -> str:
+    response = get_anthropic_client().messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Body proportions: {json.dumps(body)}\n\n"
+                f"Garment tag: {json.dumps(tag)}\n\n"
+                "Give a practical 3–4 sentence fit recommendation: will this size fit, "
+                "which areas may be loose or tight, and one styling tip for this body type."
+            )
+        }]
+    )
+    return response.content[0].text
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -217,7 +286,7 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════════════════
 st.title("👗 My Virtual Closet")
 
-tab_closet, tab_tryon = st.tabs(["🗄️ My Closet", "✨ Virtual Try-On"])
+tab_closet, tab_tryon, tab_fit = st.tabs(["🗄️ My Closet", "✨ Virtual Try-On", "📐 Smart Fit"])
 
 # ── TAB 1: Closet ─────────────────────────────────────────────────────────────
 with tab_closet:
@@ -353,3 +422,84 @@ with tab_tryon:
                 mime="image/jpeg",
                 use_container_width=True,
             )
+
+# ── TAB 3: Smart Fit ──────────────────────────────────────────────────────────
+with tab_fit:
+    st.subheader("📐 Smart Fit — Know Before You Buy")
+    st.caption("Scan a garment tag and Claude will tell you how it will fit your body.")
+
+    fit_left, fit_right = st.columns(2, gap="large")
+
+    with fit_left:
+        st.markdown("#### Your Body Analysis")
+        if "profile_url" not in st.session_state:
+            st.warning("Upload your full-body photo in the sidebar first.")
+        else:
+            st.image(st.session_state["profile_url"], use_container_width=True)
+            if st.button("🔍 Analyze My Proportions", type="primary", use_container_width=True):
+                with st.spinner("Analyzing your proportions…"):
+                    try:
+                        body = analyze_body_proportions(st.session_state["profile_url"])
+                        st.session_state["body_data"] = body
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
+
+            if "body_data" in st.session_state:
+                b = st.session_state["body_data"]
+                st.success("Proportions captured!")
+                cols = st.columns(2)
+                cols[0].metric("Body Type", b.get("body_type", "—").title())
+                cols[1].metric("Height", b.get("height_estimate", "—").title())
+                cols[0].metric("Shoulders", b.get("shoulder_width", "—").title())
+                cols[1].metric("Hips", b.get("hip_width", "—").title())
+                cols[0].metric("Torso", b.get("torso_length", "—").title())
+                st.info(b.get("build_notes", ""))
+
+    with fit_right:
+        st.markdown("#### Garment Tag Scanner")
+        tag_image = st.file_uploader(
+            "Photo of the tag", type=["jpg", "jpeg", "png"], key="tag_uploader"
+        )
+
+        if tag_image:
+            st.image(tag_image, use_container_width=True)
+            if st.button("📷 Read Tag", type="primary", use_container_width=True):
+                tag_image.seek(0)
+                tag_bytes = tag_image.read()
+                mime = "image/png" if tag_image.type == "image/png" else "image/jpeg"
+                with st.spinner("Reading tag…"):
+                    try:
+                        tag = read_garment_tag(tag_bytes, mime)
+                        st.session_state["tag_data"] = tag
+                    except Exception as e:
+                        st.error(f"Tag reading failed: {e}")
+
+        if "tag_data" in st.session_state:
+            t = st.session_state["tag_data"]
+            st.success(f"Size: **{t.get('size_label', '?')}**" + (f"  ·  {t.get('brand')}" if t.get('brand') else ""))
+            measurements = {k: v for k, v in {
+                "Chest": t.get("chest_cm"), "Waist": t.get("waist_cm"),
+                "Hip": t.get("hip_cm"), "Length": t.get("length_cm"),
+                "Inseam": t.get("inseam_cm"),
+            }.items() if v}
+            if measurements:
+                mcols = st.columns(len(measurements))
+                for col, (label, val) in zip(mcols, measurements.items()):
+                    col.metric(label, f"{val} cm")
+            if t.get("fabric"):
+                st.caption(f"Fabric: {t['fabric']}")
+
+    # Fit Report
+    if "body_data" in st.session_state and "tag_data" in st.session_state:
+        st.divider()
+        st.markdown("#### Fit Report")
+        if st.button("✨ Generate Fit Report", type="primary", use_container_width=True):
+            with st.spinner("Generating your fit report…"):
+                try:
+                    report = get_fit_report(st.session_state["body_data"], st.session_state["tag_data"])
+                    st.session_state["fit_report"] = report
+                except Exception as e:
+                    st.error(f"Report failed: {e}")
+
+        if "fit_report" in st.session_state:
+            st.info(st.session_state["fit_report"])
