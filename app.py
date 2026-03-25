@@ -4,7 +4,7 @@ from PIL import Image
 import io
 import base64
 from supabase import create_client, Client
-import replicate
+import time
 from datetime import datetime
 
 # ── Page Config ───────────────────────────────────────────────────────────────
@@ -95,10 +95,13 @@ def profile_photo_url() -> str | None:
 
 # ── Virtual Try-On ────────────────────────────────────────────────────────────
 def run_virtual_tryon(human_url: str, garment_url: str, garment_type: str) -> str:
-    client = replicate.Client(api_token=st.secrets["REPLICATE_API_TOKEN"])
-    output = client.run(
-        "cuuupid/idm-vton",
-        input={
+    headers = {
+        "Authorization": f"Bearer {st.secrets['REPLICATE_API_TOKEN']}",
+        "Content-Type": "application/json",
+        "Prefer": "wait",
+    }
+    payload = {
+        "input": {
             "human_img": human_url,
             "garm_img": garment_url,
             "garment_des": f"clothing item ({garment_type.replace('_', ' ')})",
@@ -107,10 +110,33 @@ def run_virtual_tryon(human_url: str, garment_url: str, garment_type: str) -> st
             "denoise_steps": 30,
             "seed": 42,
             "category": garment_type,
-        },
+        }
+    }
+    r = requests.post(
+        "https://api.replicate.com/v1/models/cuuupid/idm-vton/predictions",
+        headers=headers,
+        json=payload,
+        timeout=120,
     )
-    # IDM-VTON returns a list; first item is the try-on image
-    return str(output[0]) if isinstance(output, list) else str(output)
+    r.raise_for_status()
+    prediction = r.json()
+
+    if prediction.get("status") == "succeeded":
+        output = prediction["output"]
+        return output[0] if isinstance(output, list) else output
+
+    # Poll until done
+    poll_url = prediction["urls"]["get"]
+    for _ in range(60):
+        time.sleep(3)
+        poll = requests.get(poll_url, headers=headers, timeout=10).json()
+        if poll["status"] == "succeeded":
+            output = poll["output"]
+            return output[0] if isinstance(output, list) else output
+        if poll["status"] in ("failed", "canceled"):
+            raise Exception(f"Prediction {poll['status']}: {poll.get('error')}")
+
+    raise Exception("Timed out waiting for try-on result.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
